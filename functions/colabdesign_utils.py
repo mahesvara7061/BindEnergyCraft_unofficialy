@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import jax
 import jax.numpy as jnp
+from jax.scipy.special import logsumexp
 from scipy.special import softmax
 from colabdesign import mk_afdesign_model, clear_mem
 from colabdesign.mpnn import mk_mpnn_model
@@ -42,6 +43,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
                                     "i_pae":advanced_settings["weights_pae_inter"],
                                     "con":advanced_settings["weights_con_intra"],
                                     "i_con":advanced_settings["weights_con_inter"],
+                                    "weights_ptme":advanced_settings["weights_ptme"]
                                     })
 
     # redefine intramolecular contacts (con) and intermolecular contacts (i_con) definitions
@@ -61,6 +63,9 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
     if advanced_settings["use_termini_distance_loss"]:
         # termini distance loss
         add_termini_distance_loss(af_model, advanced_settings["weights_termini_loss"])
+
+    if advanced_settings["use_ptme_loss"]:   
+        add_ptme_loss(af_model, advanced_settings["weights_ptme"])  
 
     # add the helicity loss
     add_helix_loss(af_model, helicity_value)
@@ -262,6 +267,7 @@ def predict_binder_complex(prediction_model, binder_sequence, mpnn_design_name, 
                 'i_pTM': round(prediction_metrics['i_ptm'], 2), 
                 'pAE': round(prediction_metrics['pae'], 2), 
                 'i_pAE': round(prediction_metrics['i_pae'], 2)
+                "pTME": round(prediction_metrics["ptme"], 2)
             }
             prediction_stats[model_num+1] = stats
 
@@ -391,6 +397,81 @@ def add_i_ptm_loss(self, weight=0.1):
     self._callbacks["model"]["loss"].append(loss_iptm)
     self.opt["weights"]["i_ptm"] = weight
 
+# Define pTMEnergy (pTME) loss for colabdesign / BindCraft
+def add_ptme_loss(self, weight=0.05):
+    """
+    Add pTMEnergy (BECraft) as a differentiable loss term.
+    - Uses AF 'predicted_aligned_error' logits and bin breaks.
+    - Applies TM-style kernel g(d) = 1 / (1 + (d/d0(N))^2).
+    - Averages over inter-chain (binder <-> target) pairs only.
+    - Returns a scalar "ptme" to be MINIMIZED (more negative -> better interface).
+    """
+
+    def _tm_d0(N: int) -> jnp.ndarray:
+        # classic TM-score d0(N), clamped to avoid tiny/negative values
+        d0 = 1.24 * (jnp.maximum(jnp.asarray(N, jnp.float32), 1.0) - 15.0) ** (1.0 / 3.0) - 1.8
+        return jnp.maximum(d0, jnp.asarray(1e-3, jnp.float32))
+
+    def _bin_centers_from_breaks(breaks: jnp.ndarray | None, num_bins: int, max_err: float = 31.75) -> jnp.ndarray:
+        if breaks is None:
+            edges = jnp.linspace(0.0, max_err, num_bins + 1, dtype=jnp.float32)
+        else:
+            edges = jnp.concatenate(
+                [jnp.array([0.0], jnp.float32), breaks.astype(jnp.float32), jnp.array([max_err], jnp.float32)], axis=0
+            )
+        return 0.5 * (edges[:-1] + edges[1:])  # (B,)
+
+    def _masked_mean(x: jnp.ndarray, mask_bool: jnp.ndarray) -> jnp.ndarray:
+        mask = mask_bool.astype(x.dtype)
+        denom = jnp.maximum(mask.sum(), jnp.asarray(1.0, x.dtype))
+        return (x * mask).sum() / denom
+
+    def loss_ptme(inputs, outputs):
+        pae = outputs.get("predicted_aligned_error", None)
+        if pae is None or ("logits" not in pae):
+            # If PAE logits are missing (e.g., wrong model), return a harmless zero
+            return {"ptme": jnp.asarray(0.0, jnp.float32)}
+
+        logits = pae["logits"]  # (L, L, B)
+        L = logits.shape[0]
+        B = logits.shape[-1]
+        breaks = pae.get("breaks", None)
+
+        # Build TM kernel over PAE bin centers
+        centers = _bin_centers_from_breaks(breaks, B)                # (B,)
+        d0 = _tm_d0(L)
+        g = 1.0 / (1.0 + (centers / d0) ** 2)                        # (B,)
+
+        logZ = logsumexp(logits, axis=-1)
+        lse = logsumexp(logits + jnp.log(g + 1e-12)[None, None, :], axis=-1) - logZ
+
+        # Inter-chain mask (target first, binder second)
+        L_t = int(getattr(self, "_target_len", 0))
+        L_b = int(getattr(self, "_binder_len", 0))
+        if (L_t + L_b == L) and (L_t > 0 and L_b > 0):
+            binder_vec = jnp.concatenate([jnp.zeros((L_t,), dtype=bool),
+                                          jnp.ones((L_b,), dtype=bool)], axis=0)               # (L,)
+            target_vec = jnp.logical_not(binder_vec)                                            # (L,)
+            inter = jnp.logical_or(jnp.logical_and(binder_vec[:, None], target_vec[None, :]),
+                                   jnp.logical_and(target_vec[:, None], binder_vec[None, :]))   # (L,L) bool
+            ptme_energy = -_masked_mean(lse, inter)  # <-- no x[mask]; keeps static shape
+        else:
+            # fallback: try asym ids from inputs; if missing, average all pairs
+            asym = None
+            for k in ("asym_id", "chain_index", "asym_index"):
+                if (inputs is not None) and (k in inputs):
+                    asym = inputs[k]; break
+            if (asym is not None) and (asym.shape[0] == L):
+                inter = (asym[:, None] != asym[None, :])
+                ptme_energy = -_masked_mean(lse, inter)
+            else:
+                ptme_energy = -jnp.mean(lse)
+
+        return {"ptme": ptme_energy}
+
+    # Register the loss callback and weight
+    self._callbacks["model"]["loss"].append(loss_ptme)
+    self.opt["weights"]["ptme"] = weight
 # add helicity loss
 def add_helix_loss(self, weight=0):
     def binder_helicity(inputs, outputs):  
