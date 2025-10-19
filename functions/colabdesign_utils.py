@@ -37,6 +37,15 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
     af_model.prep_inputs(pdb_filename=starting_pdb, chain=chain, binder_len=length, hotspot=target_hotspot_residues, seed=seed, rm_aa=advanced_settings["omit_AAs"],
                         rm_target_seq=advanced_settings["rm_template_seq_design"], rm_target_sc=advanced_settings["rm_template_sc_design"])
 
+        # DEBUG: xem các chain_index hiện có và số residue mỗi chain
+    try:
+        ci = af_model._inputs.get("chain_index", None)
+        if ci is not None:
+            uniq, counts = np.unique(np.array(ci), return_counts=True)
+            print("[DEBUG] chain_index uniq:", uniq, "counts:", counts)
+    except Exception as _e:
+        pass
+
     ### Update weights based on specified settings
     af_model.opt["weights"].update({"pae":advanced_settings["weights_pae_intra"],
                                     "plddt":advanced_settings["weights_plddt"],
@@ -65,7 +74,29 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
         add_termini_distance_loss(af_model, advanced_settings["weights_termini_loss"])
 
     if advanced_settings["use_ptme_loss"]:   
-        add_ptme_loss(af_model, advanced_settings["weights_ptme"])  
+        add_ptme_loss(af_model, advanced_settings["weights_ptme"]) 
+
+        # ---- Dual-target pTME with softmax-balance (A vs B) ----
+    if advanced_settings.get("use_dual_ptme_loss", False):
+        # đọc cấu hình; nếu thiếu sẽ raise để bạn chủ động set
+        chains_A = advanced_settings["dual_ptme_chains_A"]          # ví dụ: [0]
+        chains_B = advanced_settings["dual_ptme_chains_B"]          # ví dụ: [1]
+        binder_chain_id = advanced_settings["dual_ptme_binder_chain_id"]  # ví dụ: 2
+
+        weight = float(advanced_settings.get("weights_multi_ptme", 0.05))
+        tau = float(advanced_settings.get("tau_multi_ptme", 0.2))
+        iface_thresh = float(advanced_settings.get("iface_thresh", 0.30))  # dùng ở bước 3
+
+        add_dual_ptme_softmax_loss(
+            af_model,
+            chains_A=chains_A,
+            chains_B=chains_B,
+            binder_chain_id=binder_chain_id,
+            weight=weight,
+            tau=tau,
+            iface_thresh=iface_thresh,
+        )
+ 
 
     # add the helicity loss
     add_helix_loss(af_model, helicity_value)
@@ -266,7 +297,7 @@ def predict_binder_complex(prediction_model, binder_sequence, mpnn_design_name, 
                 'pTM': round(prediction_metrics['ptm'], 2), 
                 'i_pTM': round(prediction_metrics['i_ptm'], 2), 
                 'pAE': round(prediction_metrics['pae'], 2), 
-                'i_pAE': round(prediction_metrics['i_pae'], 2)
+                'i_pAE': round(prediction_metrics['i_pae'], 2),
                 "pTME": round(prediction_metrics["ptme"], 2)
             }
             prediction_stats[model_num+1] = stats
@@ -472,6 +503,104 @@ def add_ptme_loss(self, weight=0.05):
     # Register the loss callback and weight
     self._callbacks["model"]["loss"].append(loss_ptme)
     self.opt["weights"]["ptme"] = weight
+
+# ---- Dual-target pTME with softmax-balance (A vs B) ----
+def add_dual_ptme_softmax_loss(self,
+                                chains_A,           # list[int] các chain_index của target A (vd [0])
+                                chains_B,           # list[int] các chain_index của target B (vd [1])
+                                binder_chain_id,    # int chain_index của binder (vd 2)
+                                weight=0.05,        # wE
+                                tau=0.2,            # temperature cho softmax cân bằng
+                                iface_thresh=0.30   # ngưỡng lấy site (sẽ dùng ở bước 2 khi thêm geodesic)
+                                ):
+    """
+    Tính pTME riêng cho interface Binder<->A và Binder<->B, rồi cân bằng bằng softmax:
+      L = weight * ( wA * pTME_A + wB * pTME_B ),  w = softmax([pTME_A, pTME_B]/tau)
+    GHI CHÚ:
+      - Chưa thêm geodesic/overlap ở bước này. Chỉ 1 scalar 'multi_ptme' để MINIMIZE.
+      - Cách tính pTME dùng lại logic TM-kernel trên PAE logits như add_ptme_loss.
+    """
+
+    import jax.numpy as jnp
+    from jax.scipy.special import logsumexp
+
+    def _tm_d0(N: int) -> jnp.ndarray:
+        d0 = 1.24 * (jnp.maximum(jnp.asarray(N, jnp.float32), 1.0) - 15.0) ** (1.0 / 3.0) - 1.8
+        return jnp.maximum(d0, jnp.asarray(1e-3, jnp.float32))
+
+    def _bin_centers_from_breaks(breaks: jnp.ndarray | None, num_bins: int, max_err: float = 31.75) -> jnp.ndarray:
+        if breaks is None:
+            edges = jnp.linspace(0.0, max_err, num_bins + 1, dtype=jnp.float32)
+        else:
+            edges = jnp.concatenate(
+                [jnp.array([0.0], jnp.float32), breaks.astype(jnp.float32), jnp.array([max_err], jnp.float32)], axis=0
+            )
+        return 0.5 * (edges[:-1] + edges[1:])  # (B,)
+
+    def _masked_mean(x: jnp.ndarray, mask_bool: jnp.ndarray) -> jnp.ndarray:
+        mask = mask_bool.astype(x.dtype)
+        denom = jnp.maximum(mask.sum(), jnp.asarray(1.0, x.dtype))
+        return (x * mask).sum() / denom
+
+    def _tm_lse_from_pae(pae):
+        logits = pae["logits"]  # (L,L,B)
+        L = logits.shape[0]
+        B = logits.shape[-1]
+        breaks = pae.get("breaks", None)
+        centers = _bin_centers_from_breaks(breaks, B)     # (B,)
+        d0 = _tm_d0(L)
+        g = 1.0 / (1.0 + (centers / d0) ** 2)            # (B,)
+        logZ = logsumexp(logits, axis=-1)
+        lse = logsumexp(logits + jnp.log(g + 1e-12)[None, None, :], axis=-1) - logZ  # (L,L)
+        return lse
+
+    def _inter_mask(chain_idx, src_list, dst_id):
+        # true ở (i,j) nếu i thuộc src_list và j==dst_id, hoặc ngược lại
+        src = jnp.isin(chain_idx, jnp.array(src_list))
+        dst = (chain_idx == dst_id)
+        return jnp.logical_or(jnp.logical_and(src[:, None], dst[None, :]),
+                              jnp.logical_and(dst[:, None], src[None, :]))  # (L,L) bool
+
+    def _ptme_from_mask(lse, mask_bool):
+        return -_masked_mean(lse, mask_bool)   # âm trung bình log-expected kernel → minimize
+
+    def loss_dual_ptme(inputs, outputs):
+        pae = outputs.get("predicted_aligned_error", None)
+        if pae is None or ("logits" not in pae) or ("chain_index" not in inputs):
+            return {"multi_ptme": jnp.asarray(0.0, jnp.float32)}
+
+        lse = _tm_lse_from_pae(pae)                   # (L,L)
+        chain_idx = inputs["chain_index"]             # (L,)
+
+        mA = _inter_mask(chain_idx, jnp.array(chains_A), binder_chain_id)
+        mB = _inter_mask(chain_idx, jnp.array(chains_B), binder_chain_id)
+
+        pA = _ptme_from_mask(lse, mA)                 # scalar
+        pB = _ptme_from_mask(lse, mB)                 # scalar
+
+        w = jnp.exp(jnp.array([pA, pB]) / tau)
+        w = w / (w.sum() + 1e-12)
+
+        L_energy = weight * (w[0] * pA + w[1] * pB)
+        return {"multi_ptme": L_energy}
+
+    # Đăng ký callback + trọng số
+    if not any(getattr(cb, "__name__", "") == "loss_dual_ptme" for cb in self._callbacks["model"]["loss"]):
+        loss_dual_ptme.__name__ = "loss_dual_ptme"
+        self._callbacks["model"]["loss"].append(loss_dual_ptme)
+
+    self.opt.setdefault("weights", {})
+    self.opt["weights"]["multi_ptme"] = float(weight)
+    self.opt["tau"] = float(tau)
+    # lưu cấu hình để dùng ở bước 2 (geodesic/overlap)
+    self.opt["dual_ptme_cfg"] = {
+        "chains_A": list(map(int, chains_A)),
+        "chains_B": list(map(int, chains_B)),
+        "binder_chain_id": int(binder_chain_id),
+        "iface_thresh": float(iface_thresh),
+    }
+
+
 # add helicity loss
 def add_helix_loss(self, weight=0):
     def binder_helicity(inputs, outputs):  
