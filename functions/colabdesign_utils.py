@@ -36,7 +36,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
 
     af_model.prep_inputs(pdb_filename=starting_pdb, chain=chain, binder_len=length, hotspot=target_hotspot_residues, seed=seed, rm_aa=advanced_settings["omit_AAs"],
                         rm_target_seq=advanced_settings["rm_template_seq_design"], rm_target_sc=advanced_settings["rm_template_sc_design"])
-
+    
         # DEBUG: xem các chain_index hiện có và số residue mỗi chain
     try:
         ci = af_model._inputs.get("chain_index", None)
@@ -611,35 +611,35 @@ def add_dual_ptme_softmax_loss(self, chains_A, chains_B, binder_chain_id,
         target_len = int(getattr(self, "_target_len", 233))
         binder_len = int(getattr(self, "_binder_len", 117))
         
-        # Check if targets are merged (asym_id only shows 2 chains instead of 3)
-        unique_chains = jnp.unique(chain_idx)
+        # Check if we should use residue-based or chain-based masking
+        # Count unique chain values (works in JIT by checking actual values)
+        max_chain_id = jnp.max(chain_idx)
         
-        if len(unique_chains) == 2:
-            # Targets are merged in one chain - use RESIDUE RANGES
-            # Based on original PDB: Chain A=192, Chain B=143, but target_len might be different
-            # Use proportional split based on original lengths
-            target_A_end = int(target_len * (192.0 / 335.0))  # Proportional to original
-            
-            # Create residue-based masks
-            # Target A <-> Binder
-            mask_A = jnp.zeros((L, L), dtype=bool)
-            mask_A = mask_A.at[0:target_A_end, target_len:L].set(True)
-            mask_A = mask_A.at[target_len:L, 0:target_A_end].set(True)
-            
-            # Target B <-> Binder  
-            mask_B = jnp.zeros((L, L), dtype=bool)
-            mask_B = mask_B.at[target_A_end:target_len, target_len:L].set(True)
-            mask_B = mask_B.at[target_len:L, target_A_end:target_len].set(True)
-            
-            pA = _ptme_from_mask(lse, mask_A)
-            pB = _ptme_from_mask(lse, mask_B)
-        else:
-            # Targets are separate chains - use chain-based masks (original logic)
-            mA = _inter_mask(chain_idx, jnp.array(chains_A), binder_chain_id)
-            mB = _inter_mask(chain_idx, jnp.array(chains_B), binder_chain_id)
-            
-            pA = _ptme_from_mask(lse, mA)
-            pB = _ptme_from_mask(lse, mB)
+        # If max_chain_id == 1, we have 2 chains (0 and 1) - targets are merged
+        # If max_chain_id >= 2, we have 3+ chains - targets are separate
+        use_residue_masks = (max_chain_id <= 1)
+        
+        # Residue-based masks (for merged targets)
+        target_A_end = int(target_len * (192.0 / 335.0))  # Proportional to original
+        
+        mask_A_res = jnp.zeros((L, L), dtype=bool)
+        mask_A_res = mask_A_res.at[0:target_A_end, target_len:L].set(True)
+        mask_A_res = mask_A_res.at[target_len:L, 0:target_A_end].set(True)
+        
+        mask_B_res = jnp.zeros((L, L), dtype=bool)
+        mask_B_res = mask_B_res.at[target_A_end:target_len, target_len:L].set(True)
+        mask_B_res = mask_B_res.at[target_len:L, target_A_end:target_len].set(True)
+        
+        # Chain-based masks (for separate targets)
+        mask_A_chain = _inter_mask(chain_idx, jnp.array(chains_A), binder_chain_id)
+        mask_B_chain = _inter_mask(chain_idx, jnp.array(chains_B), binder_chain_id)
+        
+        # Select appropriate masks based on structure
+        mask_A = jnp.where(use_residue_masks, mask_A_res, mask_A_chain)
+        mask_B = jnp.where(use_residue_masks, mask_B_res, mask_B_chain)
+        
+        pA = _ptme_from_mask(lse, mask_A)
+        pB = _ptme_from_mask(lse, mask_B)
         
         # Get current iteration for tau annealing
         current_iter = getattr(self, '_iter', 0)
