@@ -628,13 +628,14 @@ def add_dual_ptme_softmax_loss(self, chains_A, chains_B, binder_chain_id,
 
     self.opt.setdefault("weights", {})
     self.opt["weights"]["multi_ptme"] = float(weight)
-    self.opt["tau"] = float(tau)
     # lưu cấu hình để dùng ở bước 2 (geodesic/overlap)
     self.opt["dual_ptme_cfg"] = {
         "chains_A": list(map(int, chains_A)),
         "chains_B": list(map(int, chains_B)),
         "binder_chain_id": int(binder_chain_id),
         "iface_thresh": float(iface_thresh),
+        "tau_init": float(tau_init),
+        "tau_final": float(tau_final),
     }
 
 def add_dual_overlap_geodesic_losses(
