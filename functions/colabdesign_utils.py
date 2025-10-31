@@ -810,17 +810,55 @@ def add_dual_overlap_geodesic_losses(
     def loss_overlap_geo(inputs, outputs):
         pae = outputs.get("predicted_aligned_error", None)
         xyz = outputs.get("structure_module", None)
-        if pae is None or ("logits" not in pae) or ("chain_index" not in inputs) or xyz is None:
+        
+        # Try to find chain information - prefer chain_index, fallback to asym_id
+        chain_idx = None
+        for key in ["chain_index", "asym_id", "entity_id"]:
+            if key in inputs:
+                chain_idx = inputs[key]
+                break
+        
+        if pae is None or ("logits" not in pae) or (chain_idx is None) or xyz is None:
             return {"overlap": jnp.asarray(0.0, jnp.float32),
                     "geo_sep": jnp.asarray(0.0, jnp.float32)}
 
-        chain_idx = inputs["chain_index"]           # (L,)
         lse = _tm_lse_from_pae(pae)                 # (L,L)
-
-        # masks inter cho A và B
-        interA = _inter_mask(chain_idx, chains_A, binder_chain_id)
-        interB = _inter_mask(chain_idx, chains_B, binder_chain_id)
-        bm = _binder_mask(chain_idx, binder_chain_id)
+        
+        # Get dimensions for residue-based masking if needed
+        L = lse.shape[0]
+        target_len = int(getattr(self, "_target_len", 233))
+        
+        # Check if we should use residue-based or chain-based masking
+        max_chain_id = jnp.max(chain_idx)
+        use_residue_masks = (max_chain_id <= 1)
+        
+        # For residue-based approach (when targets are merged)
+        target_A_end = int(target_len * (192.0 / 335.0))
+        
+        # Create residue-based masks for interface detection
+        # Target A <-> Binder interactions
+        mask_A_res = jnp.zeros((L, L), dtype=bool)
+        mask_A_res = mask_A_res.at[0:target_A_end, target_len:L].set(True)
+        mask_A_res = mask_A_res.at[target_len:L, 0:target_A_end].set(True)
+        
+        # Target B <-> Binder interactions
+        mask_B_res = jnp.zeros((L, L), dtype=bool)
+        mask_B_res = mask_B_res.at[target_A_end:target_len, target_len:L].set(True)
+        mask_B_res = mask_B_res.at[target_len:L, target_A_end:target_len].set(True)
+        
+        # Chain-based masks (for separate targets)
+        mask_A_chain = _inter_mask(chain_idx, chains_A, binder_chain_id)
+        mask_B_chain = _inter_mask(chain_idx, chains_B, binder_chain_id)
+        
+        # Select appropriate masks
+        interA = jnp.where(use_residue_masks, mask_A_res, mask_A_chain)
+        interB = jnp.where(use_residue_masks, mask_B_res, mask_B_chain)
+        
+        # Binder mask - works for both residue and chain-based approaches
+        # When max_chain_id <= 1: binder is chain 1
+        # When max_chain_id >= 2: binder is binder_chain_id
+        binder_id = jnp.where(use_residue_masks, 1, binder_chain_id)
+        bm = (chain_idx == binder_id)
 
         # score mềm trên binder
         sA = _soft_iface_scores(lse, interA, bm)    # (L,)
