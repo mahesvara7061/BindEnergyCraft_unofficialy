@@ -1,5 +1,5 @@
 {   
-    "use_ptme_loss": true,
+    "use_ptme_loss": false,
     "weights_ptme": 0.05,
     "use_i_ptm_loss": false,
     "omit_AAs": "C",
@@ -63,13 +63,20 @@
     "acceptance_rate": 0.01,
     "start_monitoring": 600,
     "af_params_dir": "",
-    "dssp_path": "",
-    "dalphaball_path": "",
+    "dssp_path": "/content/bindcraft/functions/dssp",
+    "dalphaball_path": "/content/bindcraft/functions/DAlphaBall.gcc",
     "use_dual_ptme_loss": true,
     "dual_ptme_chains_A": [0],
     "dual_ptme_chains_B": [1],
     "dual_ptme_binder_chain_id": 2,
     "weights_multi_ptme": 0.05,
     "tau_multi_ptme": 0.2,
-    "iface_thresh": 0.30
+    "iface_thresh": 0.30,
+    "weights_overlap": 0.2,
+    "weights_geo": 0.1,
+    "geo_min": 25.0,
+    "geo_r_cut": 8.0,
+    "geo_sigma": 3.0,
+    "tau_multi_ptme_init": 0.5,
+    "tau_multi_ptme_final": 0.1
 }
