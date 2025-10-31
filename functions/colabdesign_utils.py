@@ -96,6 +96,22 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
             tau=tau,
             iface_thresh=iface_thresh,
         )
+
+
+        # >>> THÊM GỌI PHẦN NÀY <<<
+        add_dual_overlap_geodesic_losses(
+            af_model,
+            chains_A=chains_A,
+            chains_B=chains_B,
+            binder_chain_id=binder_chain_id,
+            weight_overlap=float(advanced_settings.get("weights_overlap", 0.2)),
+            weight_geo=float(advanced_settings.get("weights_geo", 0.1)),
+            iface_thresh=float(advanced_settings.get("iface_thresh", 0.30)),
+            r_cut=float(advanced_settings.get("geo_r_cut", 8.0)),
+            sigma=float(advanced_settings.get("geo_sigma", 3.0)),
+            geo_min=float(advanced_settings.get("geo_min", 25.0)),
+        )
+
  
 
     # add the helicity loss
@@ -274,6 +290,14 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
 def predict_binder_complex(prediction_model, binder_sequence, mpnn_design_name, target_pdb, chain, length, trajectory_pdb, prediction_models, advanced_settings, filters, design_paths, failure_csv, seed=None):
     prediction_stats = {}
 
+    try:
+        if advanced_settings.get("use_ptme_loss", False):
+            names = [getattr(cb, "__name__", "") for cb in prediction_model._callbacks["model"]["loss"]]
+            if "loss_ptme" not in names:
+                add_ptme_loss(prediction_model, weight=0.0)
+    except Exception:
+        pass
+
     # clean sequence
     binder_sequence = re.sub("[^A-Z]", "", binder_sequence.upper())
 
@@ -293,13 +317,15 @@ def predict_binder_complex(prediction_model, binder_sequence, mpnn_design_name, 
 
             # extract the statistics for the model
             stats = {
-                'pLDDT': round(prediction_metrics['plddt'], 2), 
-                'pTM': round(prediction_metrics['ptm'], 2), 
-                'i_pTM': round(prediction_metrics['i_ptm'], 2), 
-                'pAE': round(prediction_metrics['pae'], 2), 
+                'pLDDT': round(prediction_metrics['plddt'], 2),
+                'pTM': round(prediction_metrics['ptm'], 2),
+                'i_pTM': round(prediction_metrics['i_ptm'], 2),
+                'pAE': round(prediction_metrics['pae'], 2),
                 'i_pAE': round(prediction_metrics['i_pae'], 2),
-                "pTME": round(prediction_metrics["ptme"], 2)
             }
+            ptme_val = prediction_metrics.get("ptme", None)
+            stats["pTME"] = round(ptme_val, 2) if (ptme_val is not None) else None
+
             prediction_stats[model_num+1] = stats
 
             # List of filter conditions and corresponding keys
@@ -505,14 +531,9 @@ def add_ptme_loss(self, weight=0.05):
     self.opt["weights"]["ptme"] = weight
 
 # ---- Dual-target pTME with softmax-balance (A vs B) ----
-def add_dual_ptme_softmax_loss(self,
-                                chains_A,           # list[int] các chain_index của target A (vd [0])
-                                chains_B,           # list[int] các chain_index của target B (vd [1])
-                                binder_chain_id,    # int chain_index của binder (vd 2)
-                                weight=0.05,        # wE
-                                tau=0.2,            # temperature cho softmax cân bằng
-                                iface_thresh=0.30   # ngưỡng lấy site (sẽ dùng ở bước 2 khi thêm geodesic)
-                                ):
+def add_dual_ptme_softmax_loss(self, chains_A, chains_B, binder_chain_id, 
+                                weight=0.05, tau_init=0.5, tau_final=0.1, 
+                                iface_thresh=0.30):
     """
     Tính pTME riêng cho interface Binder<->A và Binder<->B, rồi cân bằng bằng softmax:
       L = weight * ( wA * pTME_A + wB * pTME_B ),  w = softmax([pTME_A, pTME_B]/tau)
@@ -578,11 +599,26 @@ def add_dual_ptme_softmax_loss(self,
         pA = _ptme_from_mask(lse, mA)                 # scalar
         pB = _ptme_from_mask(lse, mB)                 # scalar
 
+        current_iter = getattr(self, '_iter', 0)
+        total_iters = getattr(self, '_max_iter', 200)
+        
+        # Linear annealing
+        tau = tau_init + (tau_final - tau_init) * min(current_iter / total_iters, 1.0)
+        
+        # Compute softmax weights with annealed temperature
         w = jnp.exp(jnp.array([pA, pB]) / tau)
         w = w / (w.sum() + 1e-12)
 
+
         L_energy = weight * (w[0] * pA + w[1] * pB)
-        return {"multi_ptme": L_energy}
+        return {
+            "multi_ptme": L_energy,
+            "ptme_A": pA,  # Monitor individual target energies
+            "ptme_B": pB,
+            "weight_A": w[0],  # Monitor softmax weights
+            "weight_B": w[1],
+            "tau_current": tau  # Monitor annealing schedule
+        }
 
     # Đăng ký callback + trọng số
     if not any(getattr(cb, "__name__", "") == "loss_dual_ptme" for cb in self._callbacks["model"]["loss"]):
@@ -599,6 +635,189 @@ def add_dual_ptme_softmax_loss(self,
         "binder_chain_id": int(binder_chain_id),
         "iface_thresh": float(iface_thresh),
     }
+
+def add_dual_overlap_geodesic_losses(
+    self,
+    chains_A, chains_B, binder_chain_id,
+    weight_overlap=0.2,       # λ_cap
+    weight_geo=0.1,           # λ_geo
+    iface_thresh=0.30,        # ngưỡng tạo S_A, S_B
+    r_cut=8.0,                # bán kính lân cận CA-CA cho đồ thị bề mặt
+    sigma=3.0,                # cho kernel Gaussian lân cận
+    geo_min=25.0,             # d_min^geo
+):
+    """
+    - Xây site mềm S_A, S_B từ lse (giống pTME kernel), rồi:
+      * overlap Jaccard(SA, SB) → phạt trùng site
+      * geodesic separation E[d_geo] giữa SA và SB → tăng khoảng cách trên bề mặt
+    - Trả về 2 loss scalar: "overlap" và "geo_sep".
+    """
+
+    import jax
+    import jax.numpy as jnp
+    from jax.scipy.special import logsumexp
+
+    def _tm_d0(N: int) -> jnp.ndarray:
+        d0 = 1.24 * (jnp.maximum(jnp.asarray(N, jnp.float32), 1.0) - 15.0) ** (1.0 / 3.0) - 1.8
+        return jnp.maximum(d0, jnp.asarray(1e-3, jnp.float32))
+
+    def _bin_centers_from_breaks(breaks: jnp.ndarray | None, num_bins: int, max_err: float = 31.75) -> jnp.ndarray:
+        if breaks is None:
+            edges = jnp.linspace(0.0, max_err, num_bins + 1, dtype=jnp.float32)
+        else:
+            edges = jnp.concatenate(
+                [jnp.array([0.0], jnp.float32), breaks.astype(jnp.float32), jnp.array([max_err], jnp.float32)], axis=0
+            )
+        return 0.5 * (edges[:-1] + edges[1:])  # (B,)
+
+    def _tm_lse_from_pae(pae):
+        logits = pae["logits"]  # (L,L,B)
+        L = logits.shape[0]
+        B = logits.shape[-1]
+        breaks = pae.get("breaks", None)
+        centers = _bin_centers_from_breaks(breaks, B)     # (B,)
+        d0 = _tm_d0(L)
+        g = 1.0 / (1.0 + (centers / d0) ** 2)            # (B,)
+        logZ = logsumexp(logits, axis=-1)
+        lse = logsumexp(logits + jnp.log(g + 1e-12)[None, None, :], axis=-1) - logZ  # (L,L)
+        return lse
+
+    def _inter_mask(chain_idx, src_list, dst_id):
+        src = jnp.isin(chain_idx, jnp.array(src_list))
+        dst = (chain_idx == dst_id)
+        return jnp.logical_or(jnp.logical_and(src[:, None], dst[None, :]),
+                              jnp.logical_and(dst[:, None], src[None, :]))  # (L,L) bool
+
+    def _binder_mask(chain_idx, binder_id):
+        return (chain_idx == binder_id)
+
+    def _soft_iface_scores(lse, mask_bool, binder_mask):
+        # lấy điểm tương tác "mềm" trên binder: score_b(i) = mean_j lse[i,j] cho các (i,j) nằm trong mask inter
+        # sau đó chỉ giữ các i thuộc binder
+        m = mask_bool.astype(lse.dtype)
+        s_i = (lse * m).sum(axis=1) / (m.sum(axis=1) + 1e-12)   # (L,)
+        s_i = jnp.where(binder_mask, s_i, 0.0)                  # chỉ binder
+        # chuẩn hoá về [0,1] tương đối (không bắt buộc, nhưng giúp ổn định)
+        s_min = s_i.min()
+        s_max = s_i.max()
+        s = (s_i - s_min) / (s_max - s_min + 1e-12)
+        return s  # (L,)
+
+    def _binary_set_from_score(s, thr):
+        # S = {i | s_i >= thr}
+        return (s >= thr)
+
+    def _jaccard(a_bool, b_bool):
+        a = a_bool.astype(jnp.float32)
+        b = b_bool.astype(jnp.float32)
+        inter = (a * b).sum()
+        union = (a + b - a * b).sum()
+        return inter / (union + 1e-6)
+
+    def _pairwise_dists_CA(xyz):
+        # xyz: (L, 37, 3) from structure_module; lấy CA
+        ca = xyz[:, residue_constants.atom_order["CA"]]  # (L,3)
+        d = jnp.sqrt(jnp.maximum(((ca[:, None, :] - ca[None, :, :]) ** 2).sum(-1), 1e-12))  # (L,L)
+        return d
+
+    def _graph_resistance_distance(d_euclid, binder_mask, r_cut=8.0, sigma=3.0):
+        # Đồ thị trên binder theo CA-CA; trọng số Gaussian với ngưỡng r_cut
+        # Tính "resistance distance" xấp xỉ bằng pseudo-inverse Laplacian.
+        bm = binder_mask.astype(bool)
+        d_bb = d_euclid[bm][:, bm]     # (Lb,Lb)
+        Lb = d_bb.shape[0]
+        A = jnp.exp(-(d_bb ** 2) / (2 * (sigma ** 2))) * (d_bb <= r_cut)  # adjacency
+        # Laplacian
+        deg = jnp.diag(jnp.sum(A, axis=1))
+        Lmat = deg - A + 1e-6 * jnp.eye(Lb)  # regularize
+        # pseudo-inverse bằng eigh (ổn định hơn inv cho JAX)
+        w, V = jnp.linalg.eigh(Lmat)
+        # More robust pseudo-inverse with adaptive threshold
+        w_inv = jnp.where(w > 1e-5, 1.0 / w, 0.0)  # Slightly relaxed threshold
+        L_plus = (V * w_inv) @ V.T
+
+        # Alternative: Add stronger diagonal regularization
+        Lmat = deg - A + 1e-4 * jnp.eye(Lb)  # Increase from 1e-6 to 1e-4                 # (Lb,Lb)
+        # resistance distance giữa i,j: r_ij = L+_ii + L+_jj - 2L+_ij
+        diag = jnp.diag(L_plus)
+        R = diag[:, None] + diag[None, :] - 2.0 * L_plus  # (Lb,Lb)
+        return R, bm  # trả về (distance trên binder, mask vị trí binder trong toàn chuỗi)
+
+    def _expect_geo_distance(R_binder, bm, pA, pB):
+        pA_b = pA[bm]
+        pB_b = pB[bm]
+        
+        # Check if distributions are non-empty
+        sumA = pA_b.sum()
+        sumB = pB_b.sum()
+        
+        # If either distribution is empty, return large distance (no penalty)
+        valid = (sumA > 1e-8) & (sumB > 1e-8)
+        
+        pA_b = pA_b / jnp.maximum(sumA, 1e-12)
+        pB_b = pB_b / jnp.maximum(sumB, 1e-12)
+        
+        E_geo = (pA_b[None, :] @ R_binder @ pB_b[:, None]).squeeze()
+        
+        # Return large value if invalid (no penalty applied)
+        return jnp.where(valid, E_geo, 100.0)
+
+    def loss_overlap_geo(inputs, outputs):
+        pae = outputs.get("predicted_aligned_error", None)
+        xyz = outputs.get("structure_module", None)
+        if pae is None or ("logits" not in pae) or ("chain_index" not in inputs) or xyz is None:
+            return {"overlap": jnp.asarray(0.0, jnp.float32),
+                    "geo_sep": jnp.asarray(0.0, jnp.float32)}
+
+        chain_idx = inputs["chain_index"]           # (L,)
+        lse = _tm_lse_from_pae(pae)                 # (L,L)
+
+        # masks inter cho A và B
+        interA = _inter_mask(chain_idx, chains_A, binder_chain_id)
+        interB = _inter_mask(chain_idx, chains_B, binder_chain_id)
+        bm = _binder_mask(chain_idx, binder_chain_id)
+
+        # score mềm trên binder
+        sA = _soft_iface_scores(lse, interA, bm)    # (L,)
+        sB = _soft_iface_scores(lse, interB, bm)    # (L,)
+
+        # nhị phân hoá theo ngưỡng iface_thresh
+        SA = _binary_set_from_score(sA, iface_thresh)
+        SB = _binary_set_from_score(sB, iface_thresh)
+
+        # Overlap Jaccard
+        jac = _jaccard(SA, SB)                     # ∈[0,1]
+        L_overlap = weight_overlap * jac
+
+        # Geodesic: dựng đồ thị trên binder và tính resistance distance
+        d_e = _pairwise_dists_CA(xyz["final_atom_positions"])  # (L,L)
+        R_binder, mask_b = _graph_resistance_distance(d_e, bm, r_cut=r_cut, sigma=sigma)
+
+        # phân bố mềm p_A, p_B (chuẩn hoá về xác suất)
+        pA = jnp.maximum(sA, 0.0)
+        pB = jnp.maximum(sB, 0.0)
+        pA = pA / (pA.sum() + 1e-12)
+        pB = pB / (pB.sum() + 1e-12)
+
+        E_geo = _expect_geo_distance(R_binder, mask_b, pA, pB)   # kỳ vọng khoảng cách địa hình
+        # loss đẩy xa: [geo_min - E_geo]_+
+        L_geo = weight_geo * jax.nn.relu(geo_min - E_geo)
+
+        return {"overlap": L_overlap, "geo_sep": L_geo}
+
+    # đăng ký callback và weights
+    loss_overlap_geo.__name__ = "loss_overlap_geo"
+    self._callbacks["model"]["loss"].append(loss_overlap_geo)
+    self.opt["weights"]["overlap"] = float(weight_overlap)
+    self.opt["weights"]["geo_sep"] = float(weight_geo)
+    # lưu cấu hình
+    self.opt["dual_ptme_geom"] = {
+        "iface_thresh": float(iface_thresh),
+        "r_cut": float(r_cut),
+        "sigma": float(sigma),
+        "geo_min": float(geo_min),
+    }
+
 
 
 # add helicity loss
@@ -659,7 +878,8 @@ def add_termini_distance_loss(self, weight=0.1, threshold_distance=7.0):
 
 # plot design trajectory losses
 def plot_trajectory(af_model, design_name, design_paths):
-    metrics_to_plot = ['loss', 'plddt', 'ptm', 'i_ptm', 'con', 'i_con', 'pae', 'i_pae', 'rg', 'mpnn']
+    metrics_to_plot = ['loss', 'plddt', 'ptm', 'i_ptm', 'con', 'i_con', 'pae', 'i_pae', 'rg', 'mpnn', 
+                   'multi_ptme', 'overlap', 'geo_sep']
     colors = ['b', 'g', 'r', 'c', 'm', 'y', 'k']
 
     for index, metric in enumerate(metrics_to_plot):
