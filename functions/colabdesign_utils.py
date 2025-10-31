@@ -36,6 +36,189 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
 
     af_model.prep_inputs(pdb_filename=starting_pdb, chain=chain, binder_len=length, hotspot=target_hotspot_residues, seed=seed, rm_aa=advanced_settings["omit_AAs"],
                         rm_target_seq=advanced_settings["rm_template_seq_design"], rm_target_sc=advanced_settings["rm_template_sc_design"])
+    
+    """
+    Quick Diagnostic Script for Zero multi_ptme Issue
+    ==================================================
+
+    PASTE THIS CODE IMMEDIATELY AFTER af_model.prep_inputs() in your notebook
+    (around line 38-48 in colabdesign_utils.py, in binder_hallucination function)
+    """
+
+    # ==================== DIAGNOSTIC CODE START ====================
+    import numpy as np
+    import jax.numpy as jnp
+
+    print("\n" + "="*70)
+    print("🔍 DUAL pTME DIAGNOSTIC REPORT")
+    print("="*70)
+
+    # 1. Check if inputs are prepared
+    print("\n1️⃣ Checking af_model._inputs...")
+    if hasattr(af_model, '_inputs'):
+        inputs = af_model._inputs
+        print(f"   ✅ _inputs exists with {len(inputs)} keys")
+        print(f"   Keys: {list(inputs.keys())}")
+    else:
+        print(f"   ❌ _inputs NOT FOUND - this is a problem!")
+        inputs = None
+
+    # 2. Check for chain_index
+    print("\n2️⃣ Checking chain_index...")
+    if inputs and 'chain_index' in inputs:
+        ci = np.array(inputs['chain_index'])
+        unique, counts = np.unique(ci, return_counts=True)
+        print(f"   ✅ chain_index FOUND!")
+        print(f"   Unique chain IDs: {unique}")
+        print(f"   Residue counts per chain: {counts}")
+        print(f"   Total residues: {len(ci)}")
+        print(f"   First 10 values: {ci[:10]}")
+        print(f"   Last 10 values: {ci[-10:]}")
+        
+        # Diagnose the structure
+        print("\n   📊 Structure Analysis:")
+        if len(unique) == 2:
+            print(f"   ⚠️  Found 2 chains (expected 3 for dual-target)")
+            print(f"      → Chain 0: {counts[0]} residues (probably both targets merged)")
+            print(f"      → Chain 1: {counts[1]} residues (probably binder)")
+        elif len(unique) == 3:
+            print(f"   ✅ Found 3 chains (good!)")
+            print(f"      → Chain 0: {counts[0]} residues")
+            print(f"      → Chain 1: {counts[1]} residues")
+            print(f"      → Chain 2: {counts[2]} residues")
+        else:
+            print(f"   ⚠️  Found {len(unique)} chains (unexpected)")
+    else:
+        print(f"   ❌ chain_index NOT FOUND")
+        if inputs:
+            print(f"   Available input keys: {list(inputs.keys())}")
+            # Try alternative keys
+            for alt_key in ['asym_id', 'asym_index', 'entity_id']:
+                if alt_key in inputs:
+                    print(f"   ℹ️  Found alternative: '{alt_key}'")
+                    alt_ci = np.array(inputs[alt_key])
+                    unique_alt = np.unique(alt_ci)
+                    print(f"      Unique values: {unique_alt}")
+
+    # 3. Check target and binder lengths
+    print("\n3️⃣ Checking model structure...")
+    if hasattr(af_model, '_target_len'):
+        print(f"   ✅ _target_len: {af_model._target_len}")
+    else:
+        print(f"   ❌ _target_len NOT SET")
+
+    if hasattr(af_model, '_binder_len'):
+        print(f"   ✅ _binder_len: {af_model._binder_len}")
+    else:
+        print(f"   ❌ _binder_len NOT SET")
+
+    # 4. Check your dual pTME configuration
+    print("\n4️⃣ Checking your dual pTME configuration...")
+    print(f"   Config chains_A: {advanced_settings.get('dual_ptme_chains_A', 'NOT SET')}")
+    print(f"   Config chains_B: {advanced_settings.get('dual_ptme_chains_B', 'NOT SET')}")
+    print(f"   Config binder_chain_id: {advanced_settings.get('dual_ptme_binder_chain_id', 'NOT SET')}")
+
+    # 5. Analyze compatibility
+    print("\n5️⃣ Configuration vs Reality Check...")
+    if inputs and 'chain_index' in inputs:
+        ci = np.array(inputs['chain_index'])
+        unique_chains = np.unique(ci)
+        
+        config_A = advanced_settings.get('dual_ptme_chains_A', [0])
+        config_B = advanced_settings.get('dual_ptme_chains_B', [1])
+        config_binder = advanced_settings.get('dual_ptme_binder_chain_id', 2)
+        
+        print(f"   Expected chains in config: {set(config_A + config_B + [config_binder])}")
+        print(f"   Actual chains in structure: {set(unique_chains)}")
+        
+        missing = set(config_A + config_B + [config_binder]) - set(unique_chains)
+        if missing:
+            print(f"   ❌ MISMATCH! Missing chains: {missing}")
+            print(f"   This is why multi_ptme is zero!")
+        else:
+            print(f"   ✅ All configured chains exist")
+
+    # 6. Proposed solution
+    print("\n6️⃣ RECOMMENDED SOLUTION:")
+    if inputs and 'chain_index' in inputs:
+        ci = np.array(inputs['chain_index'])
+        unique, counts = np.unique(ci, return_counts=True)
+        
+        if len(unique) == 2:
+            print("   Your structure has 2 chains (targets merged + binder)")
+            print("   Solution A: Use residue-based dual pTME")
+            print("   -------------------------------------------")
+            print("   # In your colabdesign_utils.py, replace add_dual_ptme_softmax_loss call with:")
+            print("   add_dual_ptme_residue_based(")
+            print("       af_model,")
+            if hasattr(af_model, '_target_len'):
+                target_len = af_model._target_len
+                # Assuming your dual_target.pdb: Chain A=192, Chain B=143
+                # This is from your notebook output
+                print(f"       target_A_start=0,")
+                print(f"       target_A_end=191,      # Adjust based on your actual PDB")
+                print(f"       target_B_start=192,")
+                print(f"       target_B_end={target_len-1},")
+            else:
+                print(f"       target_A_start=0,")
+                print(f"       target_A_end=???,      # YOUR CHAIN A LENGTH - 1")
+                print(f"       target_B_start=???,    # CHAIN A LENGTH")
+                print(f"       target_B_end=???,      # TOTAL TARGET LENGTH - 1")
+            print("       weight=0.05,")
+            print("       tau=0.2")
+            print("   )")
+            print()
+            print("   OR")
+            print()
+            print("   Solution B: Update JSON config to match reality")
+            print("   -----------------------------------------------")
+            print("   {")
+            print(f'       "dual_ptme_chains_A": [0],    // Target (merged)')
+            print(f'       "dual_ptme_chains_B": [0],    // Same chain!')
+            print(f'       "dual_ptme_binder_chain_id": {unique[-1]},  // Binder')
+            print("       // Then modify loss function to use residue ranges")
+            print("   }")
+            
+        elif len(unique) == 3:
+            print("   Your structure has 3 chains - config should work!")
+            print("   Current config:")
+            print(f"   {{")
+            print(f'       "dual_ptme_chains_A": {config_A},')
+            print(f'       "dual_ptme_chains_B": {config_B},')
+            print(f'       "dual_ptme_binder_chain_id": {config_binder}')
+            print(f"   }}")
+            print()
+            print("   Suggested config based on structure:")
+            print(f"   {{")
+            print(f'       "dual_ptme_chains_A": [{unique[0]}],')
+            print(f'       "dual_ptme_chains_B": [{unique[1]}],')
+            print(f'       "dual_ptme_binder_chain_id": {unique[2]}')
+            print(f"   }}")
+    else:
+        print("   ❌ Cannot determine solution - chain_index not available")
+        print("   You may need to check:")
+        print("   1. Is use_multimer_design: true in your config?")
+        print("   2. Is prep_inputs being called correctly?")
+        print("   3. Try running af_model._prep_features() manually")
+
+    print("\n" + "="*70)
+    print("🔍 END OF DIAGNOSTIC REPORT")
+    print("="*70 + "\n")
+
+    # ==================== DIAGNOSTIC CODE END ====================
+
+    """
+    WHAT TO DO NEXT:
+    ================
+
+    1. Copy the diagnostic code above
+    2. Paste it in your notebook AFTER line 38 (after af_model.prep_inputs)
+    3. Run ONE iteration of your design
+    4. Read the diagnostic output carefully
+    5. Apply the recommended solution
+
+    The diagnostic will tell you EXACTLY what's wrong and how to fix it!
+    """
 
         # DEBUG: xem các chain_index hiện có và số residue mỗi chain
     try:
@@ -620,6 +803,7 @@ def add_dual_ptme_softmax_loss(self, chains_A, chains_B, binder_chain_id,
             "weight_B": w[1],
             "tau_current": tau  # Monitor annealing schedule
         }
+        
 
     # Đăng ký callback + trọng số
     if not any(getattr(cb, "__name__", "") == "loss_dual_ptme" for cb in self._callbacks["model"]["loss"]):
