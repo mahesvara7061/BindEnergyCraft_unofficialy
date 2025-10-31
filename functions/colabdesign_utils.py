@@ -771,37 +771,79 @@ def add_dual_ptme_softmax_loss(self, chains_A, chains_B, binder_chain_id,
 
     def loss_dual_ptme(inputs, outputs):
         pae = outputs.get("predicted_aligned_error", None)
-        if pae is None or ("logits" not in pae) or ("chain_index" not in inputs):
-            return {"multi_ptme": jnp.asarray(0.0, jnp.float32)}
+        
+        # Try to find chain information - prefer chain_index, fallback to asym_id
+        chain_idx = None
+        for key in ["chain_index", "asym_id", "entity_id"]:
+            if key in inputs:
+                chain_idx = inputs[key]
+                break
+        
+        if pae is None or ("logits" not in pae) or (chain_idx is None):
+            return {"multi_ptme": jnp.asarray(0.0, jnp.float32),
+                    "ptme_A": jnp.asarray(0.0, jnp.float32),
+                    "ptme_B": jnp.asarray(0.0, jnp.float32),
+                    "weight_A": jnp.asarray(0.5, jnp.float32),
+                    "weight_B": jnp.asarray(0.5, jnp.float32),
+                    "tau_current": jnp.asarray(tau_init, jnp.float32)}
 
         lse = _tm_lse_from_pae(pae)                   # (L,L)
-        chain_idx = inputs["chain_index"]             # (L,)
-
-        mA = _inter_mask(chain_idx, jnp.array(chains_A), binder_chain_id)
-        mB = _inter_mask(chain_idx, jnp.array(chains_B), binder_chain_id)
-
-        pA = _ptme_from_mask(lse, mA)                 # scalar
-        pB = _ptme_from_mask(lse, mB)                 # scalar
-
+        
+        # Get dimensions
+        L = lse.shape[0]
+        target_len = int(getattr(self, "_target_len", 233))
+        binder_len = int(getattr(self, "_binder_len", 117))
+        
+        # Check if targets are merged (asym_id only shows 2 chains instead of 3)
+        unique_chains = jnp.unique(chain_idx)
+        
+        if len(unique_chains) == 2:
+            # Targets are merged in one chain - use RESIDUE RANGES
+            # Based on original PDB: Chain A=192, Chain B=143, but target_len might be different
+            # Use proportional split based on original lengths
+            target_A_end = int(target_len * (192.0 / 335.0))  # Proportional to original
+            
+            # Create residue-based masks
+            # Target A <-> Binder
+            mask_A = jnp.zeros((L, L), dtype=bool)
+            mask_A = mask_A.at[0:target_A_end, target_len:L].set(True)
+            mask_A = mask_A.at[target_len:L, 0:target_A_end].set(True)
+            
+            # Target B <-> Binder  
+            mask_B = jnp.zeros((L, L), dtype=bool)
+            mask_B = mask_B.at[target_A_end:target_len, target_len:L].set(True)
+            mask_B = mask_B.at[target_len:L, target_A_end:target_len].set(True)
+            
+            pA = _ptme_from_mask(lse, mask_A)
+            pB = _ptme_from_mask(lse, mask_B)
+        else:
+            # Targets are separate chains - use chain-based masks (original logic)
+            mA = _inter_mask(chain_idx, jnp.array(chains_A), binder_chain_id)
+            mB = _inter_mask(chain_idx, jnp.array(chains_B), binder_chain_id)
+            
+            pA = _ptme_from_mask(lse, mA)
+            pB = _ptme_from_mask(lse, mB)
+        
+        # Get current iteration for tau annealing
         current_iter = getattr(self, '_iter', 0)
         total_iters = getattr(self, '_max_iter', 200)
         
-        # Linear annealing
+        # Linear annealing of temperature tau
         tau = tau_init + (tau_final - tau_init) * min(current_iter / total_iters, 1.0)
         
         # Compute softmax weights with annealed temperature
         w = jnp.exp(jnp.array([pA, pB]) / tau)
         w = w / (w.sum() + 1e-12)
-
-
+        
         L_energy = weight * (w[0] * pA + w[1] * pB)
+        
         return {
             "multi_ptme": L_energy,
-            "ptme_A": pA,  # Monitor individual target energies
+            "ptme_A": pA,
             "ptme_B": pB,
-            "weight_A": w[0],  # Monitor softmax weights
+            "weight_A": w[0],
             "weight_B": w[1],
-            "tau_current": tau  # Monitor annealing schedule
+            "tau_current": tau
         }
         
 
