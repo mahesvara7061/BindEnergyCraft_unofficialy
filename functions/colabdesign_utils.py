@@ -766,27 +766,38 @@ def add_dual_overlap_geodesic_losses(
         return d
 
     def _graph_resistance_distance(d_euclid, binder_mask, r_cut=8.0, sigma=3.0):
-        # Đồ thị trên binder theo CA-CA; trọng số Gaussian với ngưỡng r_cut
-        # Tính "resistance distance" xấp xỉ bằng pseudo-inverse Laplacian.
-        bm = binder_mask.astype(bool)
-        d_bb = d_euclid[bm][:, bm]     # (Lb,Lb)
-        Lb = d_bb.shape[0]
-        A = jnp.exp(-(d_bb ** 2) / (2 * (sigma ** 2))) * (d_bb <= r_cut)  # adjacency
-        # Laplacian
-        deg = jnp.diag(jnp.sum(A, axis=1))
-        Lmat = deg - A + 1e-6 * jnp.eye(Lb)  # regularize
-        # pseudo-inverse bằng eigh (ổn định hơn inv cho JAX)
+        # Simplified version that works on full residue space with masking
+        # Build adjacency on all residues, then mask to binder only
+        L = d_euclid.shape[0]
+        bm = binder_mask.astype(jnp.float32)  # (L,) as float for masking
+        
+        # Create 2D mask for binder-binder pairs
+        mask_2d = bm[:, None] * bm[None, :]  # (L, L)
+        
+        # Build adjacency matrix over full space, masked to binder
+        A_full = jnp.exp(-(d_euclid ** 2) / (2 * (sigma ** 2))) * (d_euclid <= r_cut)
+        A = A_full * mask_2d  # Only binder-binder edges
+        
+        # Degree matrix (sum over columns, but only count binder pairs)
+        deg_vec = jnp.sum(A, axis=1)  # (L,)
+        deg = jnp.diag(deg_vec)
+        
+        # Laplacian with regularization
+        Lmat = deg - A + 1e-4 * jnp.eye(L)
+        
+        # Pseudo-inverse
         w, V = jnp.linalg.eigh(Lmat)
-        # More robust pseudo-inverse with adaptive threshold
-        w_inv = jnp.where(w > 1e-5, 1.0 / w, 0.0)  # Slightly relaxed threshold
+        w_inv = jnp.where(w > 1e-5, 1.0 / w, 0.0)
         L_plus = (V * w_inv) @ V.T
-
-        # Alternative: Add stronger diagonal regularization
-        Lmat = deg - A + 1e-4 * jnp.eye(Lb)  # Increase from 1e-6 to 1e-4                 # (Lb,Lb)
-        # resistance distance giữa i,j: r_ij = L+_ii + L+_jj - 2L+_ij
+        
+        # Resistance distance: r_ij = L+_ii + L+_jj - 2L+_ij
         diag = jnp.diag(L_plus)
-        R = diag[:, None] + diag[None, :] - 2.0 * L_plus  # (Lb,Lb)
-        return R, bm  # trả về (distance trên binder, mask vị trí binder trong toàn chuỗi)
+        R = diag[:, None] + diag[None, :] - 2.0 * L_plus  # (L, L)
+        
+        # Mask to only return binder-binder distances
+        R = R * mask_2d
+        
+        return R, binder_mask.astype(bool)
 
     def _expect_geo_distance(R_binder, bm, pA, pB):
         pA_b = pA[bm]
