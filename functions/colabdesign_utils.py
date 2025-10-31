@@ -766,26 +766,22 @@ def add_dual_overlap_geodesic_losses(
         return d
 
     def _graph_resistance_distance(d_euclid, binder_mask, r_cut=8.0, sigma=3.0):
-        # Simplified version that works on full residue space with masking
-        # Build adjacency on all residues, then mask to binder only
+        # Đồ thị trên binder theo CA-CA; trọng số Gaussian với ngưỡng r_cut
+        # Tính "resistance distance" xấp xỉ bằng pseudo-inverse Laplacian.
+        # Returns full-size matrix (L, L) with zeros for non-binder positions
         L = d_euclid.shape[0]
-        bm = binder_mask.astype(jnp.float32)  # (L,) as float for masking
+        bm_float = binder_mask.astype(jnp.float32)
         
-        # Create 2D mask for binder-binder pairs
-        mask_2d = bm[:, None] * bm[None, :]  # (L, L)
+        # Build adjacency matrix on full sequence (but only binder-binder connections)
+        A = jnp.exp(-(d_euclid ** 2) / (2 * (sigma ** 2))) * (d_euclid <= r_cut)
+        # Mask to only binder residues
+        A = A * bm_float[:, None] * bm_float[None, :]
         
-        # Build adjacency matrix over full space, masked to binder
-        A_full = jnp.exp(-(d_euclid ** 2) / (2 * (sigma ** 2))) * (d_euclid <= r_cut)
-        A = A_full * mask_2d  # Only binder-binder edges
+        # Laplacian on full size
+        deg = jnp.diag(jnp.sum(A, axis=1))
+        Lmat = deg - A + 1e-4 * jnp.eye(L)  # regularize
         
-        # Degree matrix (sum over columns, but only count binder pairs)
-        deg_vec = jnp.sum(A, axis=1)  # (L,)
-        deg = jnp.diag(deg_vec)
-        
-        # Laplacian with regularization
-        Lmat = deg - A + 1e-4 * jnp.eye(L)
-        
-        # Pseudo-inverse
+        # Pseudo-inverse using eigh
         w, V = jnp.linalg.eigh(Lmat)
         w_inv = jnp.where(w > 1e-5, 1.0 / w, 0.0)
         L_plus = (V * w_inv) @ V.T
@@ -794,26 +790,32 @@ def add_dual_overlap_geodesic_losses(
         diag = jnp.diag(L_plus)
         R = diag[:, None] + diag[None, :] - 2.0 * L_plus  # (L, L)
         
-        # Mask to only return binder-binder distances
-        R = R * mask_2d
+        # Zero out non-binder positions
+        R = R * bm_float[:, None] * bm_float[None, :]
         
-        return R, binder_mask.astype(bool)
+        return R, binder_mask  # trả về (full-size distance matrix, binder mask)
 
     def _expect_geo_distance(R_binder, bm, pA, pB):
-        pA_b = pA[bm]
-        pB_b = pB[bm]
+        # Use masking instead of boolean indexing for JIT compatibility
+        # Zero out probabilities outside binder region
+        bm_float = bm.astype(jnp.float32)
+        pA_masked = pA * bm_float
+        pB_masked = pB * bm_float
         
         # Check if distributions are non-empty
-        sumA = pA_b.sum()
-        sumB = pB_b.sum()
+        sumA = pA_masked.sum()
+        sumB = pB_masked.sum()
         
         # If either distribution is empty, return large distance (no penalty)
         valid = (sumA > 1e-8) & (sumB > 1e-8)
         
-        pA_b = pA_b / jnp.maximum(sumA, 1e-12)
-        pB_b = pB_b / jnp.maximum(sumB, 1e-12)
+        # Normalize (division is safe due to maximum)
+        pA_norm = pA_masked / jnp.maximum(sumA, 1e-12)
+        pB_norm = pB_masked / jnp.maximum(sumB, 1e-12)
         
-        E_geo = (pA_b[None, :] @ R_binder @ pB_b[:, None]).squeeze()
+        # Compute expected distance using full-size arrays
+        # E[d] = sum_i sum_j p(i) * R[i,j] * p(j)
+        E_geo = (pA_norm @ R_binder @ pB_norm)
         
         # Return large value if invalid (no penalty applied)
         return jnp.where(valid, E_geo, 100.0)
