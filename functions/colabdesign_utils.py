@@ -87,7 +87,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
         tau = float(advanced_settings.get("tau_multi_ptme", 0.2))
         iface_thresh = float(advanced_settings.get("iface_thresh", 0.30))  # dùng ở bước 3
 
-        add_dual_ptme_loss(
+        add_dual_ptme_softmax_loss(
             af_model,
             chains_A=chains_A,
             chains_B=chains_B,
