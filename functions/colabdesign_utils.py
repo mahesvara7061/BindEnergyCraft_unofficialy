@@ -777,21 +777,22 @@ def add_dual_overlap_geodesic_losses(
         # Mask to only binder residues
         A = A * bm_float[:, None] * bm_float[None, :]
         
-        # Laplacian on full size
+        # Laplacian on full size with stronger regularization
         deg = jnp.diag(jnp.sum(A, axis=1))
-        Lmat = deg - A + 1e-4 * jnp.eye(L)  # regularize
+        Lmat = deg - A + 1e-3 * jnp.eye(L)  # Increased regularization from 1e-4 to 1e-3
         
-        # Pseudo-inverse using eigh
+        # Pseudo-inverse using eigh with more robust threshold
         w, V = jnp.linalg.eigh(Lmat)
-        w_inv = jnp.where(w > 1e-5, 1.0 / w, 0.0)
+        w_inv = jnp.where(w > 1e-4, 1.0 / w, 0.0)  # Increased threshold from 1e-5 to 1e-4
         L_plus = (V * w_inv) @ V.T
         
         # Resistance distance: r_ij = L+_ii + L+_jj - 2L+_ij
         diag = jnp.diag(L_plus)
         R = diag[:, None] + diag[None, :] - 2.0 * L_plus  # (L, L)
         
-        # Zero out non-binder positions
+        # Zero out non-binder positions and ensure no NaN/Inf
         R = R * bm_float[:, None] * bm_float[None, :]
+        R = jnp.where(jnp.isfinite(R), R, 0.0)
         
         return R, binder_mask  # trả về (full-size distance matrix, binder mask)
 
@@ -898,6 +899,10 @@ def add_dual_overlap_geodesic_losses(
         E_geo = _expect_geo_distance(R_binder, mask_b, pA, pB)   # kỳ vọng khoảng cách địa hình
         # loss đẩy xa: [geo_min - E_geo]_+
         L_geo = weight_geo * jax.nn.relu(geo_min - E_geo)
+
+        # Replace NaN/Inf with 0.0 to prevent crashes
+        L_overlap = jnp.where(jnp.isfinite(L_overlap), L_overlap, 0.0)
+        L_geo = jnp.where(jnp.isfinite(L_geo), L_geo, 0.0)
 
         return {"overlap": L_overlap, "geo_sep": L_geo}
 
