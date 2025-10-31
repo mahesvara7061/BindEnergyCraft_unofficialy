@@ -641,30 +641,43 @@ def add_dual_ptme_softmax_loss(self, chains_A, chains_B, binder_chain_id,
         pA = _ptme_from_mask(lse, mask_A)
         pB = _ptme_from_mask(lse, mask_B)
         
+        # Replace NaN/Inf in intermediate values
+        pA = jnp.where(jnp.isfinite(pA), pA, 0.0)
+        pB = jnp.where(jnp.isfinite(pB), pB, 0.0)
+        
         # Get current iteration for tau annealing
         current_iter = getattr(self, '_iter', 0)
         total_iters = getattr(self, '_max_iter', 200)
         
         # Linear annealing of temperature tau
         tau = tau_init + (tau_final - tau_init) * min(current_iter / total_iters, 1.0)
+        tau = jnp.maximum(tau, 1e-6)  # Ensure tau is never too small
         
         # Compute softmax weights with annealed temperature
-        w = jnp.exp(jnp.array([pA, pB]) / tau)
-        w = w / (w.sum() + 1e-12)
+        # Clip values before exp to prevent overflow
+        logits = jnp.array([pA, pB]) / tau
+        logits = jnp.clip(logits, -20.0, 20.0)
+        w = jnp.exp(logits)
+        w = w / jnp.maximum(w.sum(), 1e-12)
+        
+        # Replace any NaN in weights with equal weights
+        w = jnp.where(jnp.isfinite(w), w, 0.5)
         
         L_energy = weight * (w[0] * pA + w[1] * pB)
         
-        # Replace NaN with 0 to prevent logging errors
-        L_energy = jnp.where(jnp.isnan(L_energy), 0.0, L_energy)
-        pA = jnp.where(jnp.isnan(pA), 0.0, pA)
-        pB = jnp.where(jnp.isnan(pB), 0.0, pB)
+        # Final safety check for NaN/Inf
+        L_energy = jnp.where(jnp.isfinite(L_energy), L_energy, 0.0)
+        pA = jnp.where(jnp.isfinite(pA), pA, 0.0)
+        pB = jnp.where(jnp.isfinite(pB), pB, 0.0)
+        w_A = jnp.where(jnp.isfinite(w[0]), w[0], 0.5)
+        w_B = jnp.where(jnp.isfinite(w[1]), w[1], 0.5)
         
         return {
             "multi_ptme": L_energy,
             "ptme_A": pA,
             "ptme_B": pB,
-            "weight_A": w[0],
-            "weight_B": w[1],
+            "weight_A": w_A,
+            "weight_B": w_B,
             "tau_current": tau
         }
         
@@ -881,6 +894,10 @@ def add_dual_overlap_geodesic_losses(
         # score mềm trên binder
         sA = _soft_iface_scores(lse, interA, bm)    # (L,)
         sB = _soft_iface_scores(lse, interB, bm)    # (L,)
+        
+        # Guard against NaN/Inf in scores
+        sA = jnp.where(jnp.isfinite(sA), sA, 0.0)
+        sB = jnp.where(jnp.isfinite(sB), sB, 0.0)
 
         # nhị phân hoá theo ngưỡng iface_thresh
         SA = _binary_set_from_score(sA, iface_thresh)
@@ -888,6 +905,7 @@ def add_dual_overlap_geodesic_losses(
 
         # Overlap Jaccard
         jac = _jaccard(SA, SB)                     # ∈[0,1]
+        jac = jnp.where(jnp.isfinite(jac), jac, 0.0)
         L_overlap = weight_overlap * jac
 
         # Geodesic: dựng đồ thị trên binder và tính resistance distance
@@ -897,16 +915,22 @@ def add_dual_overlap_geodesic_losses(
         # phân bố mềm p_A, p_B (chuẩn hoá về xác suất)
         pA = jnp.maximum(sA, 0.0)
         pB = jnp.maximum(sB, 0.0)
-        pA = pA / (pA.sum() + 1e-12)
-        pB = pB / (pB.sum() + 1e-12)
+        pA = pA / jnp.maximum(pA.sum(), 1e-12)
+        pB = pB / jnp.maximum(pB.sum(), 1e-12)
+        
+        # Guard probability distributions
+        pA = jnp.where(jnp.isfinite(pA), pA, 0.0)
+        pB = jnp.where(jnp.isfinite(pB), pB, 0.0)
 
         E_geo = _expect_geo_distance(R_binder, mask_b, pA, pB)   # kỳ vọng khoảng cách địa hình
+        E_geo = jnp.where(jnp.isfinite(E_geo), E_geo, 100.0)
+        
         # loss đẩy xa: [geo_min - E_geo]_+
         L_geo = weight_geo * jax.nn.relu(geo_min - E_geo)
         
-        # Replace NaN with 0 to prevent logging errors
-        L_overlap = jnp.where(jnp.isnan(L_overlap), 0.0, L_overlap)
-        L_geo = jnp.where(jnp.isnan(L_geo), 0.0, L_geo)
+        # Final safety checks for NaN/Inf
+        L_overlap = jnp.where(jnp.isfinite(L_overlap), L_overlap, 0.0)
+        L_geo = jnp.where(jnp.isfinite(L_geo), L_geo, 0.0)
 
         return {"overlap": L_overlap, "geo_sep": L_geo}
 
