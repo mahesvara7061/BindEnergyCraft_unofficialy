@@ -438,8 +438,9 @@ def add_rg_loss(self, weight=0.1):
         ca = ca[-self._binder_len:]
         rg = jnp.sqrt(jnp.square(ca - ca.mean(0)).sum(-1).mean() + 1e-8)
         rg_th = 2.38 * ca.shape[0] ** 0.365
-
+        # If any CA positions are non-finite, avoid propagating NaN by returning 0.0
         rg = jax.nn.elu(rg - rg_th)
+        rg = jnp.where(jnp.all(jnp.isfinite(ca)), rg, jnp.asarray(0.0, jnp.float32))
         return {"rg":rg}
 
     self._callbacks["model"]["loss"].append(loss_fn)
@@ -488,7 +489,9 @@ def add_ptme_loss(self, weight=0.05):
         pae = outputs.get("predicted_aligned_error", None)
         if pae is None or ("logits" not in pae):
             # If PAE logits are missing (e.g., wrong model), return a harmless zero
-            return {"ptme": jnp.asarray(0.0, jnp.float32)}
+            return {"ptme": jnp.asarray(0.0, jnp.float32),
+                    "dbg_has_pae": jnp.asarray(0.0, jnp.float32),
+                    "dbg_lse_mean": jnp.asarray(0.0, jnp.float32)}
 
         logits = pae["logits"]  # (L, L, B)
         L = logits.shape[0]
@@ -524,8 +527,14 @@ def add_ptme_loss(self, weight=0.05):
                 ptme_energy = -_masked_mean(lse, inter)
             else:
                 ptme_energy = -jnp.mean(lse)
+            # Debug scalars
+            dbg_has_pae = jnp.asarray(1.0, jnp.float32)
+            # lse may contain non-finite values in rare cases; guard the mean
+            dbg_lse_mean = jnp.asarray(jnp.where(jnp.all(jnp.isfinite(lse)), jnp.mean(lse), 0.0), dtype=jnp.float32)
 
-        return {"ptme": ptme_energy}
+            return {"ptme": ptme_energy,
+                    "dbg_has_pae": dbg_has_pae,
+                    "dbg_lse_mean": dbg_lse_mean}
 
     # Register the loss callback and weight
     self._callbacks["model"]["loss"].append(loss_ptme)
