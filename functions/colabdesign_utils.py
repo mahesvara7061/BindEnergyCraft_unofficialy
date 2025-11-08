@@ -18,43 +18,6 @@ from .biopython_utils import hotspot_residues, calculate_clash_score, calc_ss_pe
 from .pyrosetta_utils import pr_relax, align_pdbs
 from .generic_utils import update_failures
 
-# Monkeypatch safety: wrap colabdesign.shared.utils.dict_to_str to tolerate NaN/Inf
-try:
-    # import the utils module (the installed package) and replace dict_to_str with a safe wrapper
-    from colabdesign import shared as _cd_shared
-    _cd_utils = getattr(_cd_shared, "utils", None)
-    if _cd_utils is not None and hasattr(_cd_utils, "dict_to_str"):
-        _orig_dict_to_str = _cd_utils.dict_to_str
-        import math as _math
-        import numpy as _np
-
-        def _safe_dict_to_str(x, filt=None, keys=None, ok=None, print_str="", f=None):
-            # Create a shallow copy and coerce any non-finite numeric values to the string 'nan'
-            try:
-                x_safe = {}
-                for k, v in x.items():
-                    # Try converting to a Python float to test finiteness; if that fails, leave the value
-                    try:
-                        vf = float(v)
-                        if not _math.isfinite(vf):
-                            x_safe[k] = "nan"
-                        else:
-                            x_safe[k] = v
-                    except Exception:
-                        # For non-scalar objects (arrays, dicts, etc.) just keep original
-                        x_safe[k] = v
-            except Exception:
-                # If anything goes wrong, fallback to original dict
-                x_safe = x
-
-            return _orig_dict_to_str(x_safe, filt=filt, keys=keys, ok=ok, print_str=print_str, f=f)
-
-        # Install wrapper
-        _cd_utils.dict_to_str = _safe_dict_to_str
-except Exception:
-    # If monkeypatching fails, don't block runtime; printing will remain as-is
-    pass
-
 # hallucinate a binder
 def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residues, length, seed, helicity_value, design_models, advanced_settings, design_paths, failure_csv):
     model_pdb_path = os.path.join(design_paths["Trajectory"], design_name+".pdb")
@@ -716,7 +679,13 @@ def add_dual_ptme_softmax_loss(self, chains_A, chains_B, binder_chain_id,
             "ptme_B": pB,
             "weight_A": w_A,
             "weight_B": w_B,
-            "tau_current": tau_out
+            "tau_current": tau_out,
+            # Debug/sanitized summaries to help trace NaNs (scalar only)
+            "dbg_ptme_A": jnp.asarray(pA, dtype=jnp.float32),
+            "dbg_ptme_B": jnp.asarray(pB, dtype=jnp.float32),
+            "dbg_wA": jnp.asarray(w[0], dtype=jnp.float32),
+            "dbg_wB": jnp.asarray(w[1], dtype=jnp.float32),
+            "dbg_tau": jnp.asarray(tau_raw, dtype=jnp.float32)
         }
         
 
@@ -970,7 +939,22 @@ def add_dual_overlap_geodesic_losses(
         L_overlap = jnp.asarray(jnp.where(jnp.isfinite(L_overlap), L_overlap, 0.0), dtype=jnp.float32)
         L_geo = jnp.asarray(jnp.where(jnp.isfinite(L_geo), L_geo, 0.0), dtype=jnp.float32)
 
-        return {"overlap": L_overlap, "geo_sep": L_geo}
+        # Debug/sanitized summaries to help trace NaNs (scalar only)
+        dbg_sA_max = jnp.asarray(jnp.where(jnp.isfinite(sA.max()), sA.max(), 0.0), dtype=jnp.float32)
+        dbg_sB_max = jnp.asarray(jnp.where(jnp.isfinite(sB.max()), sB.max(), 0.0), dtype=jnp.float32)
+        dbg_pA_sum = jnp.asarray(jnp.where(jnp.isfinite(pA.sum()), pA.sum(), 0.0), dtype=jnp.float32)
+        dbg_pB_sum = jnp.asarray(jnp.where(jnp.isfinite(pB.sum()), pB.sum(), 0.0), dtype=jnp.float32)
+        dbg_E_geo = jnp.asarray(jnp.where(jnp.isfinite(E_geo), E_geo, 100.0), dtype=jnp.float32)
+
+        return {
+            "overlap": L_overlap,
+            "geo_sep": L_geo,
+            "dbg_sA_max": dbg_sA_max,
+            "dbg_sB_max": dbg_sB_max,
+            "dbg_pA_sum": dbg_pA_sum,
+            "dbg_pB_sum": dbg_pB_sum,
+            "dbg_E_geo": dbg_E_geo,
+        }
 
     # đăng ký callback và weights
     loss_overlap_geo.__name__ = "loss_overlap_geo"
