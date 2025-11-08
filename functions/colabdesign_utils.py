@@ -649,13 +649,13 @@ def add_dual_ptme_softmax_loss(self, chains_A, chains_B, binder_chain_id,
         current_iter = getattr(self, '_iter', 0)
         total_iters = getattr(self, '_max_iter', 200)
         
-        # Linear annealing of temperature tau
-        tau = tau_init + (tau_final - tau_init) * min(current_iter / total_iters, 1.0)
-        tau = jnp.maximum(tau, 1e-6)  # Ensure tau is never too small
+        # Linear annealing of temperature tau (ensure it's a JAX array)
+        tau_raw = tau_init + (tau_final - tau_init) * min(current_iter / total_iters, 1.0)
+        tau = jnp.asarray(jnp.maximum(tau_raw, 1e-6), dtype=jnp.float32)
         
         # Compute softmax weights with annealed temperature
         # Clip values before exp to prevent overflow
-        logits = jnp.array([pA, pB]) / tau
+        logits = jnp.array([pA, pB], dtype=jnp.float32) / tau
         logits = jnp.clip(logits, -20.0, 20.0)
         w = jnp.exp(logits)
         w = w / jnp.maximum(w.sum(), 1e-12)
@@ -665,12 +665,13 @@ def add_dual_ptme_softmax_loss(self, chains_A, chains_B, binder_chain_id,
         
         L_energy = weight * (w[0] * pA + w[1] * pB)
         
-        # Final safety check for NaN/Inf
-        L_energy = jnp.where(jnp.isfinite(L_energy), L_energy, 0.0)
-        pA = jnp.where(jnp.isfinite(pA), pA, 0.0)
-        pB = jnp.where(jnp.isfinite(pB), pB, 0.0)
-        w_A = jnp.where(jnp.isfinite(w[0]), w[0], 0.5)
-        w_B = jnp.where(jnp.isfinite(w[1]), w[1], 0.5)
+        # Final safety check for NaN/Inf - convert to scalar float32
+        L_energy = jnp.asarray(jnp.where(jnp.isfinite(L_energy), L_energy, 0.0), dtype=jnp.float32)
+        pA = jnp.asarray(jnp.where(jnp.isfinite(pA), pA, 0.0), dtype=jnp.float32)
+        pB = jnp.asarray(jnp.where(jnp.isfinite(pB), pB, 0.0), dtype=jnp.float32)
+        w_A = jnp.asarray(jnp.where(jnp.isfinite(w[0]), w[0], 0.5), dtype=jnp.float32)
+        w_B = jnp.asarray(jnp.where(jnp.isfinite(w[1]), w[1], 0.5), dtype=jnp.float32)
+        tau_out = jnp.asarray(jnp.where(jnp.isfinite(tau), tau, tau_init), dtype=jnp.float32)
         
         return {
             "multi_ptme": L_energy,
@@ -678,7 +679,7 @@ def add_dual_ptme_softmax_loss(self, chains_A, chains_B, binder_chain_id,
             "ptme_B": pB,
             "weight_A": w_A,
             "weight_B": w_B,
-            "tau_current": tau
+            "tau_current": tau_out
         }
         
 
@@ -928,9 +929,9 @@ def add_dual_overlap_geodesic_losses(
         # loss đẩy xa: [geo_min - E_geo]_+
         L_geo = weight_geo * jax.nn.relu(geo_min - E_geo)
         
-        # Final safety checks for NaN/Inf
-        L_overlap = jnp.where(jnp.isfinite(L_overlap), L_overlap, 0.0)
-        L_geo = jnp.where(jnp.isfinite(L_geo), L_geo, 0.0)
+        # Final safety checks for NaN/Inf - convert to scalar float32
+        L_overlap = jnp.asarray(jnp.where(jnp.isfinite(L_overlap), L_overlap, 0.0), dtype=jnp.float32)
+        L_geo = jnp.asarray(jnp.where(jnp.isfinite(L_geo), L_geo, 0.0), dtype=jnp.float32)
 
         return {"overlap": L_overlap, "geo_sep": L_geo}
 
