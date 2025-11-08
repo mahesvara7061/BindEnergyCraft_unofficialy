@@ -18,6 +18,43 @@ from .biopython_utils import hotspot_residues, calculate_clash_score, calc_ss_pe
 from .pyrosetta_utils import pr_relax, align_pdbs
 from .generic_utils import update_failures
 
+# Monkeypatch safety: wrap colabdesign.shared.utils.dict_to_str to tolerate NaN/Inf
+try:
+    # import the utils module (the installed package) and replace dict_to_str with a safe wrapper
+    from colabdesign import shared as _cd_shared
+    _cd_utils = getattr(_cd_shared, "utils", None)
+    if _cd_utils is not None and hasattr(_cd_utils, "dict_to_str"):
+        _orig_dict_to_str = _cd_utils.dict_to_str
+        import math as _math
+        import numpy as _np
+
+        def _safe_dict_to_str(x, filt=None, keys=None, ok=None, print_str="", f=None):
+            # Create a shallow copy and coerce any non-finite numeric values to the string 'nan'
+            try:
+                x_safe = {}
+                for k, v in x.items():
+                    # Try converting to a Python float to test finiteness; if that fails, leave the value
+                    try:
+                        vf = float(v)
+                        if not _math.isfinite(vf):
+                            x_safe[k] = "nan"
+                        else:
+                            x_safe[k] = v
+                    except Exception:
+                        # For non-scalar objects (arrays, dicts, etc.) just keep original
+                        x_safe[k] = v
+            except Exception:
+                # If anything goes wrong, fallback to original dict
+                x_safe = x
+
+            return _orig_dict_to_str(x_safe, filt=filt, keys=keys, ok=ok, print_str=print_str, f=f)
+
+        # Install wrapper
+        _cd_utils.dict_to_str = _safe_dict_to_str
+except Exception:
+    # If monkeypatching fails, don't block runtime; printing will remain as-is
+    pass
+
 # hallucinate a binder
 def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residues, length, seed, helicity_value, design_models, advanced_settings, design_paths, failure_csv):
     model_pdb_path = os.path.join(design_paths["Trajectory"], design_name+".pdb")
